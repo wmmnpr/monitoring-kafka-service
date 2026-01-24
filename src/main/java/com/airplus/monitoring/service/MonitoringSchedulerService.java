@@ -12,6 +12,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -20,6 +21,7 @@ public class MonitoringSchedulerService {
     private static final Logger logger = LoggerFactory.getLogger(MonitoringSchedulerService.class);
 
     private final KafkaTemplate<String, String> kafkaTemplate;
+    private final MessageTracker messageTracker;
     private final String topicName;
 
     private final Counter messagesSentCounter;
@@ -28,9 +30,11 @@ public class MonitoringSchedulerService {
     private final Timer publishLatencyTimer;
 
     public MonitoringSchedulerService(KafkaTemplate<String, String> kafkaTemplate,
+                                      MessageTracker messageTracker,
                                       @Value("${kafka.topic.monitoring}") String topicName,
                                       MeterRegistry meterRegistry) {
         this.kafkaTemplate = kafkaTemplate;
+        this.messageTracker = messageTracker;
         this.topicName = topicName;
 
         this.messagesSentCounter = Counter.builder("kafka_messages_sent_total")
@@ -60,27 +64,31 @@ public class MonitoringSchedulerService {
 
     @Scheduled(fixedRate = 60000)
     public void sendMonitoringMessage() {
-        String message = "Monitoring heartbeat at " + Instant.now();
-        logger.info("Sending message to topic {}: {}", topicName, message);
+        String messageId = UUID.randomUUID().toString();
+        String message = String.format("{\"id\":\"%s\",\"timestamp\":\"%s\"}", messageId, Instant.now());
+
+        messageTracker.trackMessage(messageId);
+        logger.info("Sending message to topic {} with ID {}", topicName, messageId);
 
         messagesSentCounter.increment();
         long startTime = System.nanoTime();
 
-        kafkaTemplate.send(topicName, message)
+        kafkaTemplate.send(topicName, messageId, message)
                 .whenComplete((result, exception) -> {
                     long duration = System.nanoTime() - startTime;
                     publishLatencyTimer.record(duration, TimeUnit.NANOSECONDS);
 
                     if (exception == null) {
                         messagesAcknowledgedCounter.increment();
-                        logger.info("Message acknowledged - Topic: {}, Partition: {}, Offset: {}, Latency: {} ms",
-                                result.getRecordMetadata().topic(),
+                        logger.info("Message acknowledged - ID: {}, Partition: {}, Offset: {}, Latency: {} ms",
+                                messageId,
                                 result.getRecordMetadata().partition(),
                                 result.getRecordMetadata().offset(),
                                 TimeUnit.NANOSECONDS.toMillis(duration));
                     } else {
                         messagesFailedCounter.increment();
-                        logger.error("Failed to send message - Latency: {} ms, Error: {}",
+                        logger.error("Failed to send message - ID: {}, Latency: {} ms, Error: {}",
+                                messageId,
                                 TimeUnit.NANOSECONDS.toMillis(duration),
                                 exception.getMessage());
                     }
