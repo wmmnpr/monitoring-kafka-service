@@ -19,6 +19,8 @@ server:
 kafka:
   topic:
     monitoring: monitoring-events
+  monitoring:
+    publish-latency-threshold-seconds: 5.0
   tracker:
     max-age-ms: 300000
     eviction-interval-ms: 10000

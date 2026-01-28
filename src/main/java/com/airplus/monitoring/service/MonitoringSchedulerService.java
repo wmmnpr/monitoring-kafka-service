@@ -3,6 +3,7 @@ package com.airplus.monitoring.service;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.distribution.HistogramSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -23,6 +24,7 @@ public class MonitoringSchedulerService {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final MessageTracker messageTracker;
     private final String topicName;
+    private final double publishLatencyThresholdSeconds;
 
     private final Counter messagesSentCounter;
     private final Counter messagesAcknowledgedCounter;
@@ -32,10 +34,12 @@ public class MonitoringSchedulerService {
     public MonitoringSchedulerService(KafkaTemplate<String, String> kafkaTemplate,
                                       MessageTracker messageTracker,
                                       @Value("${kafka.topic.monitoring}") String topicName,
+                                      @Value("${kafka.monitoring.publish-latency-threshold-seconds}") double publishLatencyThresholdSeconds,
                                       MeterRegistry meterRegistry) {
         this.kafkaTemplate = kafkaTemplate;
         this.messageTracker = messageTracker;
         this.topicName = topicName;
+        this.publishLatencyThresholdSeconds = publishLatencyThresholdSeconds;
 
         this.messagesSentCounter = Counter.builder("kafka_messages_sent_total")
                 .description("Total number of messages sent to Kafka")
@@ -93,5 +97,24 @@ public class MonitoringSchedulerService {
                                 exception.getMessage());
                     }
                 });
+    }
+
+    @Scheduled(fixedRate = 30000)
+    public void checkPublishLatency() {
+        HistogramSnapshot snapshot = publishLatencyTimer.takeSnapshot();
+        for (var pv : snapshot.percentileValues()) {
+            if (pv.percentile() == 0.95) {
+                double p95Seconds = pv.value(TimeUnit.SECONDS);
+                if (p95Seconds > publishLatencyThresholdSeconds) {
+                    logger.warn("p95 publish latency {}s exceeds threshold {}s for topic {}",
+                            String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
+                } else {
+                    logger.debug("p95 publish latency {}s within threshold {}s for topic {}",
+                            String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
+                }
+                return;
+            }
+        }
+        logger.debug("No p95 percentile data available yet for topic {}", topicName);
     }
 }
