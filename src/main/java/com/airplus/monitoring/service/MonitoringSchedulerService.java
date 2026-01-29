@@ -7,9 +7,14 @@ import io.micrometer.core.instrument.distribution.HistogramSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -25,6 +30,8 @@ public class MonitoringSchedulerService {
     private final MessageTracker messageTracker;
     private final String topicName;
     private final double publishLatencyThresholdSeconds;
+    private final RestTemplate restTemplate;
+    private final String alertEndpoint;
 
     private final Counter messagesSentCounter;
     private final Counter messagesAcknowledgedCounter;
@@ -35,11 +42,18 @@ public class MonitoringSchedulerService {
                                       MessageTracker messageTracker,
                                       @Value("${kafka.topic.monitoring}") String topicName,
                                       @Value("${kafka.monitoring.publish-latency-threshold-seconds}") double publishLatencyThresholdSeconds,
+                                      @Value("${kafka.monitoring.alert.endpoint}") String alertEndpoint,
+                                      @Value("${kafka.monitoring.alert.username}") String alertUsername,
+                                      @Value("${kafka.monitoring.alert.password}") String alertPassword,
                                       MeterRegistry meterRegistry) {
         this.kafkaTemplate = kafkaTemplate;
         this.messageTracker = messageTracker;
         this.topicName = topicName;
         this.publishLatencyThresholdSeconds = publishLatencyThresholdSeconds;
+        this.alertEndpoint = alertEndpoint;
+        this.restTemplate = new RestTemplateBuilder()
+                .basicAuthentication(alertUsername, alertPassword)
+                .build();
 
         this.messagesSentCounter = Counter.builder("kafka_messages_sent_total")
                 .description("Total number of messages sent to Kafka")
@@ -108,6 +122,7 @@ public class MonitoringSchedulerService {
                 if (p95Seconds > publishLatencyThresholdSeconds) {
                     logger.warn("p95 publish latency {}s exceeds threshold {}s for topic {}",
                             String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
+                    sendLatencyAlert(p95Seconds);
                 } else {
                     logger.debug("p95 publish latency {}s within threshold {}s for topic {}",
                             String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
@@ -116,5 +131,22 @@ public class MonitoringSchedulerService {
             }
         }
         logger.debug("No p95 percentile data available yet for topic {}", topicName);
+    }
+
+    private void sendLatencyAlert(double p95Seconds) {
+        try {
+            String payload = String.format(
+                    "{\"topic\":\"%s\",\"p95LatencySeconds\":%.3f,\"thresholdSeconds\":%.3f,\"timestamp\":\"%s\"}",
+                    topicName, p95Seconds, publishLatencyThresholdSeconds, Instant.now());
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<String> request = new HttpEntity<>(payload, headers);
+
+            restTemplate.postForEntity(alertEndpoint, request, String.class);
+            logger.info("Latency alert sent to {}", alertEndpoint);
+        } catch (Exception e) {
+            logger.error("Failed to send latency alert to {}: {}", alertEndpoint, e.getMessage());
+        }
     }
 }

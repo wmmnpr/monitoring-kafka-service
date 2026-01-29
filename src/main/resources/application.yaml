@@ -21,6 +21,10 @@ kafka:
     monitoring: monitoring-events
   monitoring:
     publish-latency-threshold-seconds: 5.0
+    alert:
+      endpoint: http://localhost:8081/alerts
+      username: admin
+      password: changeme
   tracker:
     max-age-ms: 300000
     eviction-interval-ms: 10000
