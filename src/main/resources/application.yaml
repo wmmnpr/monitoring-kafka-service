@@ -25,6 +25,7 @@ kafka:
       endpoint: http://localhost:8081/alerts
       username: admin
       password: changeme
+      cooldown-seconds: 300
   tracker:
     max-age-ms: 300000
     eviction-interval-ms: 10000

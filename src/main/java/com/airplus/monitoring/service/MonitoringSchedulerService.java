@@ -28,6 +28,8 @@ public class MonitoringSchedulerService {
     private final String topicName;
     private final double publishLatencyThresholdSeconds;
     private final WebClient webClient;
+    private final long alertCooldownMs;
+    private Instant lastAlertSentAt = Instant.MIN;
 
     private final Counter messagesSentCounter;
     private final Counter messagesAcknowledgedCounter;
@@ -41,11 +43,13 @@ public class MonitoringSchedulerService {
                                       @Value("${kafka.monitoring.alert.endpoint}") String alertEndpoint,
                                       @Value("${kafka.monitoring.alert.username}") String alertUsername,
                                       @Value("${kafka.monitoring.alert.password}") String alertPassword,
+                                      @Value("${kafka.monitoring.alert.cooldown-seconds}") long alertCooldownSeconds,
                                       MeterRegistry meterRegistry) {
         this.kafkaTemplate = kafkaTemplate;
         this.messageTracker = messageTracker;
         this.topicName = topicName;
         this.publishLatencyThresholdSeconds = publishLatencyThresholdSeconds;
+        this.alertCooldownMs = TimeUnit.SECONDS.toMillis(alertCooldownSeconds);
         this.webClient = WebClient.builder()
                 .baseUrl(alertEndpoint)
                 .defaultHeaders(headers -> headers.setBasicAuth(alertUsername, alertPassword))
@@ -118,7 +122,12 @@ public class MonitoringSchedulerService {
                 if (p95Seconds > publishLatencyThresholdSeconds) {
                     logger.warn("p95 publish latency {}s exceeds threshold {}s for topic {}",
                             String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
-                    sendLatencyAlert(p95Seconds);
+                    if (Duration.between(lastAlertSentAt, Instant.now()).toMillis() >= alertCooldownMs) {
+                        sendLatencyAlert(p95Seconds);
+                    } else {
+                        logger.debug("Latency alert suppressed, cooldown active until {}",
+                                lastAlertSentAt.plusMillis(alertCooldownMs));
+                    }
                 } else {
                     logger.debug("p95 publish latency {}s within threshold {}s for topic {}",
                             String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
@@ -130,9 +139,11 @@ public class MonitoringSchedulerService {
     }
 
     private void sendLatencyAlert(double p95Seconds) {
+        lastAlertSentAt = Instant.now();
+
         String payload = String.format(
                 "{\"topic\":\"%s\",\"p95LatencySeconds\":%.3f,\"thresholdSeconds\":%.3f,\"timestamp\":\"%s\"}",
-                topicName, p95Seconds, publishLatencyThresholdSeconds, Instant.now());
+                topicName, p95Seconds, publishLatencyThresholdSeconds, lastAlertSentAt);
 
         webClient.post()
                 .contentType(MediaType.APPLICATION_JSON)
