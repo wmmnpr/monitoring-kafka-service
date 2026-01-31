@@ -29,7 +29,9 @@ public class MonitoringSchedulerService {
     private final double publishLatencyThresholdSeconds;
     private final WebClient webClient;
     private final long alertCooldownMs;
+    private final long publishLatencyStaleMs;
     private Instant lastAlertSentAt = Instant.MIN;
+    private volatile Instant lastLatencyRecordedAt = Instant.MIN;
 
     private final Counter messagesSentCounter;
     private final Counter messagesAcknowledgedCounter;
@@ -44,12 +46,14 @@ public class MonitoringSchedulerService {
                                       @Value("${kafka.monitoring.alert.username}") String alertUsername,
                                       @Value("${kafka.monitoring.alert.password}") String alertPassword,
                                       @Value("${kafka.monitoring.alert.cooldown-seconds}") long alertCooldownSeconds,
+                                      @Value("${kafka.monitoring.publish-latency-stale-seconds}") long publishLatencyStaleSeconds,
                                       MeterRegistry meterRegistry) {
         this.kafkaTemplate = kafkaTemplate;
         this.messageTracker = messageTracker;
         this.topicName = topicName;
         this.publishLatencyThresholdSeconds = publishLatencyThresholdSeconds;
         this.alertCooldownMs = TimeUnit.SECONDS.toMillis(alertCooldownSeconds);
+        this.publishLatencyStaleMs = TimeUnit.SECONDS.toMillis(publishLatencyStaleSeconds);
         this.webClient = WebClient.builder()
                 .baseUrl(alertEndpoint)
                 .defaultHeaders(headers -> headers.setBasicAuth(alertUsername, alertPassword))
@@ -95,6 +99,7 @@ public class MonitoringSchedulerService {
                 .whenComplete((result, exception) -> {
                     long duration = System.nanoTime() - startTime;
                     publishLatencyTimer.record(duration, TimeUnit.NANOSECONDS);
+                    lastLatencyRecordedAt = Instant.now();
 
                     if (exception == null) {
                         messagesAcknowledgedCounter.increment();
@@ -116,8 +121,10 @@ public class MonitoringSchedulerService {
     @Scheduled(fixedRate = 30000)
     public void checkPublishLatency() {
         HistogramSnapshot snapshot = publishLatencyTimer.takeSnapshot();
+        boolean foundP95 = false;
         for (var pv : snapshot.percentileValues()) {
             if (pv.percentile() == 0.95) {
+                foundP95 = true;
                 double p95Seconds = pv.value(TimeUnit.SECONDS);
                 if (p95Seconds > publishLatencyThresholdSeconds) {
                     logger.warn("p95 publish latency {}s exceeds threshold {}s for topic {}",
@@ -132,10 +139,45 @@ public class MonitoringSchedulerService {
                     logger.debug("p95 publish latency {}s within threshold {}s for topic {}",
                             String.format("%.3f", p95Seconds), String.format("%.3f", publishLatencyThresholdSeconds), topicName);
                 }
-                return;
+                break;
             }
         }
-        logger.debug("No p95 percentile data available yet for topic {}", topicName);
+        if (!foundP95) {
+            logger.debug("No p95 percentile data available yet for topic {}", topicName);
+        }
+
+        checkStaleness();
+    }
+
+    private void checkStaleness() {
+        if (!lastLatencyRecordedAt.equals(Instant.MIN)
+                && Duration.between(lastLatencyRecordedAt, Instant.now()).toMillis() >= publishLatencyStaleMs) {
+            logger.warn("publishLatencyTimer has not been updated for {}ms (threshold {}ms) for topic {}",
+                    Duration.between(lastLatencyRecordedAt, Instant.now()).toMillis(), publishLatencyStaleMs, topicName);
+            if (Duration.between(lastAlertSentAt, Instant.now()).toMillis() >= alertCooldownMs) {
+                sendStalenessAlert();
+            } else {
+                logger.debug("Staleness alert suppressed, cooldown active until {}",
+                        lastAlertSentAt.plusMillis(alertCooldownMs));
+            }
+        }
+    }
+
+    private void sendStalenessAlert() {
+        lastAlertSentAt = Instant.now();
+
+        String payload = String.format(
+                "{\"alertType\":\"stale\",\"topic\":\"%s\",\"lastRecordedAt\":\"%s\",\"staleThresholdSeconds\":%d,\"timestamp\":\"%s\"}",
+                topicName, lastLatencyRecordedAt, TimeUnit.MILLISECONDS.toSeconds(publishLatencyStaleMs), lastAlertSentAt);
+
+        webClient.post()
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(payload)
+                .retrieve()
+                .toBodilessEntity()
+                .doOnSuccess(response -> logger.info("Staleness alert sent successfully"))
+                .doOnError(e -> logger.error("Failed to send staleness alert: {}", e.getMessage()))
+                .subscribe();
     }
 
     private void sendLatencyAlert(double p95Seconds) {

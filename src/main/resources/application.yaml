@@ -21,6 +21,7 @@ kafka:
     monitoring: monitoring-events
   monitoring:
     publish-latency-threshold-seconds: 5.0
+    publish-latency-stale-seconds: 120
     alert:
       endpoint: http://localhost:8081/alerts
       username: admin
