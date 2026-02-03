@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class MonitoringSchedulerService {
@@ -31,7 +32,7 @@ public class MonitoringSchedulerService {
     private final long alertCooldownMs;
     private final long publishLatencyStaleMs;
     private Instant lastAlertSentAt = Instant.MIN;
-    private volatile Instant lastLatencyRecordedAt = Instant.MIN;
+    private final AtomicReference<Instant> lastLatencyRecordedAt = new AtomicReference<>(Instant.MIN);
 
     private final Counter messagesSentCounter;
     private final Counter messagesAcknowledgedCounter;
@@ -99,7 +100,7 @@ public class MonitoringSchedulerService {
                 .whenComplete((result, exception) -> {
                     long duration = System.nanoTime() - startTime;
                     publishLatencyTimer.record(duration, TimeUnit.NANOSECONDS);
-                    lastLatencyRecordedAt = Instant.now();
+                    lastLatencyRecordedAt.set(Instant.now());
 
                     if (exception == null) {
                         messagesAcknowledgedCounter.increment();
@@ -150,10 +151,11 @@ public class MonitoringSchedulerService {
     }
 
     private void checkStaleness() {
-        if (!lastLatencyRecordedAt.equals(Instant.MIN)
-                && Duration.between(lastLatencyRecordedAt, Instant.now()).toMillis() >= publishLatencyStaleMs) {
+        Instant lastRecorded = lastLatencyRecordedAt.get();
+        if (!lastRecorded.equals(Instant.MIN)
+                && Duration.between(lastRecorded, Instant.now()).toMillis() >= publishLatencyStaleMs) {
             logger.warn("publishLatencyTimer has not been updated for {}ms (threshold {}ms) for topic {}",
-                    Duration.between(lastLatencyRecordedAt, Instant.now()).toMillis(), publishLatencyStaleMs, topicName);
+                    Duration.between(lastRecorded, Instant.now()).toMillis(), publishLatencyStaleMs, topicName);
             if (Duration.between(lastAlertSentAt, Instant.now()).toMillis() >= alertCooldownMs) {
                 sendStalenessAlert();
             } else {
@@ -168,7 +170,7 @@ public class MonitoringSchedulerService {
 
         String payload = String.format(
                 "{\"alertType\":\"stale\",\"topic\":\"%s\",\"lastRecordedAt\":\"%s\",\"staleThresholdSeconds\":%d,\"timestamp\":\"%s\"}",
-                topicName, lastLatencyRecordedAt, TimeUnit.MILLISECONDS.toSeconds(publishLatencyStaleMs), lastAlertSentAt);
+                topicName, lastLatencyRecordedAt.get(), TimeUnit.MILLISECONDS.toSeconds(publishLatencyStaleMs), lastAlertSentAt);
 
         webClient.post()
                 .contentType(MediaType.APPLICATION_JSON)
